@@ -1,0 +1,447 @@
+---
+title: "R code and corresponding files to the manuscript Umirbekov, A., Essery, R., Müller, D. ('2023') 'GEMS v1.0: Generalizable empirical model of snow accumulation and melt based on daily snow mass changes in response to climate and topographic drivers.'(manuscript details are TBA)"
+date: "2023-05-10"
+---
+
+```{r}
+# Loading/installing necessary R packages:
+packages <- c( "e1071", 'geosphere', "readr", "dplyr","ggplot2", "tidyr", "lubridate",'hydroGOF', 'MLmetrics',
+               'doParallel', 'scales', 'caretEnsemble'
+               )
+
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+# The pretrained SVR model is available in three versions, each designed for a different number of predictors:
+
+```{r}
+SVR_7P <- readRDS(".../GEMS_v1.0/SVR_GEMS_7P.rds")
+SVR_5P <- readRDS(".../GEMS_v1.0/SVR_GEMS_5P.rds")
+SVR_4P <- readRDS(".../GEMS_v1.0/SVR_GEMS_4P.rds")
+```
+
+# Download the independent SNOTEL stations data
+
+```{r}
+
+SNOTEL<-read_csv("...GEMS_v1.0/SNOTEL.csv", 
+                 col_types = cols(...1 = col_skip()))
+
+str(SNOTEL, max.level=1) 
+
+```
+
+# The dataset includes observations from 520 SNOTEL stations which were not used for training SVR models. All temperature variables (TAVG,TMAX,TMIN) were corrected for the bias in temperature sensor. The dataset also includes heat-load index (CHILI) after Theobald et al 2015, estimated for each station location through Google Erath Engine platform <https://developers.google.com/earth-engine/datasets/catalog/CSP_ERGo_1_0_Global_SRTM_CHILI>
+
+# The chunks below show how the GEMS model can be applied on a single station data:
+
+```{r}
+stlist<-unique(SNOTEL$Station) # list of stations ID
+
+station<-SNOTEL[SNOTEL$Station==stlist[1],]  # extracting data corresponding to the first station in 'stlist'
+
+```
+
+# Generating additional variables:
+
+```{r}
+station$DAYL<-geosphere:: daylength(station$LAT, station$Date)  # Daylength
+
+station$TSUM<-data.table::frollsum(station$TAVG, algo="exact", n=3, align='right')
+station<-station %>% 
+  mutate(TSUM = lag(TSUM))   # Rolling sum of temperature over preceding three days
+
+station$PSUM<-data.table::frollsum(station$PRCP, algo="exact", n=3, align='right')
+station<-station %>% 
+  mutate(PSUM = lag(PSUM))   # Rolling sum of precipitation over preceding three days
+
+
+station<-station[-c(1:3),] # Input data should not contain any missing values. Since TSUM and PSUM are not available for the first three days of the timeseries, we have to exclude first three rows. 
+
+```
+
+# Running the GEMS_7P version of the model:
+
+```{r}
+
+    station$dSWE<-ifelse(station$TAVG < -1, # this corresponds to 'Ts' threshold noted in the manuscript. It serves as temperature criterion when all precipitation is considered as snowfall
+                         station$PRCP,  # 
+                         predict(SVR_7P, station)) # estimating 'dSWE' when 'TAVG' is greater or equal to 'Ts' 
+    
+    station$simSWE<- Reduce(\(.x, .y) ifelse(.x + .y < 0, 0, .x + .y), station$dSWE, accumulate = TRUE) # this line is the cumulative sum-reset function
+    station$simSWE[1]<- ifelse(station$simSWE[1]<0, 0,station$simSWE[1]) # since the line above does not account for the first observation, we have to nullify it in case if the first 'dSWE' is negative
+  
+
+
+
+str(station,max.level=1) 
+
+```
+
+# Now the 'station' dataframe has two new columns, where the 'simSWE' is simulated SWE
+
+# Comparing simulated vs observed SWE for the station:
+
+```{r}
+hydroGOF::ggof(station$SWE, station$simSWE, na.rm=TRUE,
+               dates = station$Date,lab.tstep="months",
+               gofs = c("MAE", "RMSE", "NSE", "R2", "KGE"),
+               ylab="SWE (mm)",xlab="",main="",
+               col=c("#67a9cf","#b2182b"),lty=c(1,1), lwd = 3,
+               legend=c("observed","simulated"),leg.gof=TRUE, leg.cex = 1.5,
+               legend.position <- "center")
+```
+
+```{r}
+maxSWE<-station %>% 
+  group_by(year(Date)) %>% 
+  dplyr::summarise(maxSWE=max(SWE,na.rm = TRUE),
+                   maxSimSWE=max(simSWE))%>% slice(-1) # a dataframe of max observed and simulated SWE for each year
+```
+
+# Mean Absolute Percentage Error of maxSWE (%):
+
+```{r}
+round(MLmetrics::MAPE(maxSWE$maxSWE,maxSWE$maxSimSWE),2)*100 
+```
+
+# Percent bias of maxSWE (%):
+
+```{r}
+hydroGOF::pbias(maxSWE$maxSWE,maxSWE$maxSimSWE)   
+```
+
+# Snowmelt date error (days):
+
+```{r}
+obsmelt<-station %>% 
+  group_by(lubridate::year(Date))%>%
+  dplyr::filter(SWE== 0)%>% 
+  top_n(-1, Date) %>%
+  ungroup()
+
+simmelt<-station %>% 
+  group_by(lubridate::year(Date)) %>%
+  dplyr::filter( simSWE== 0) %>% 
+  top_n(-1, Date) %>%
+  ungroup()
+
+meltout<-merge(obsmelt[,c('Date','lubridate::year(Date)')],
+               simmelt[,c('Date','lubridate::year(Date)')], by="lubridate::year(Date)", all = TRUE)
+
+meltout<-meltout[-1,]
+mean(difftime(as.Date(meltout$Date.x),as.Date(meltout$Date.y),units="days"))
+
+```
+
+# Running the model for all SNOTEL stations in the dataset and summarizing evaluation metrics.
+
+#The loop below will run the GEMS model for each of the 520 SNOTEL stations in a parallel mode. The loop then compares simulated vs actual SWE, and returns evaluation results for all stations as a single dataframe. Note: Depending on configuration of PC and number of cores in particular, running the loop may take up to 15 minutes.
+
+```{r}
+
+cl <- makeCluster(detectCores()*0.8)
+registerDoParallel(cl)   
+
+system.time(
+  
+  eval_results<-foreach(m = 1:length(stlist),.combine=cbind,.packages = c("dplyr","caret","e1071","caret","hydroGOF","MLmetrics")) %dopar% {
+    ID<-stlist[m]
+    station<-SNOTEL[which(SNOTEL$Station==ID), ]
+    
+    station$DAYL<-geosphere:: daylength(station$LAT, station$Date)
+    station$TSUM<-data.table::frollsum(station$TAVG,algo="exact", n=3, align='right')
+    station$PSUM<-data.table::frollsum(station$PRCP, algo="exact", n=3, align='right')
+    
+    station<-station %>% 
+      mutate(PSUM = lag(PSUM))
+    
+    station<-station %>% 
+      mutate(TSUM = lag(TSUM))
+    
+
+    station<-station[-c(1:3),]
+
+    {
+      
+      station$dSWE<-ifelse(station$TAVG< -1,station$PRCP,predict(SVR_7P,station))
+      station$simSWE<- Reduce(\(.x, .y) ifelse(.x + .y < 0, 0, .x + .y), station$dSWE, accumulate = TRUE)
+      station$SWE[1]<- ifelse(station$SWE[1]<0, 0,station$SWE[1])
+      }
+    
+
+    metrics<-hydroGOF:: gof(station$SWE, station$simSWE, na.rm=TRUE)
+    colnames(metrics)<-ID
+    
+    
+    obsmelt<-station %>% 
+      group_by(lubridate::year(Date)) %>%
+      dplyr::filter( SWE== 0) %>% 
+      top_n(-1, Date) %>%
+      ungroup()
+    
+    simmelt<-station %>% 
+      group_by(lubridate::year(Date)) %>%
+      dplyr::filter( simSWE== 0) %>% 
+      top_n(-1, Date) %>%
+      ungroup()
+    
+    
+    bb<-merge(obsmelt,simmelt, by="lubridate::year(Date)", all = TRUE)  
+    bb<-bb[!is.na(bb$Date.x),]
+    bb<-bb[!is.na(bb$Date.y),]
+    cc<-difftime(bb$Date.x,bb$Date.y,units="days")
+    
+    metrics[1,1]<-mean(cc[-1])
+    rownames(metrics)[1]<-"diff.days"
+    
+    
+    peakbias<-station %>% 
+      group_by(lubridate:: year(Date)) %>% 
+      dplyr::summarise(maxSWE=max(SWE,na.rm = TRUE),
+                       maxSimSWE=max(simSWE))
+    
+    peakbias<-peakbias[-1,]
+    
+    metrics[2,1]<-hydroGOF::pbias(peakbias$maxSWE,peakbias$maxSimSWE)
+
+    rownames(metrics)[2]<-"maxSWEbias"
+    metrics[3,1]<-round(MLmetrics::MAPE(peakbias$maxSWE,peakbias$maxSimSWE),2)*100
+    round(mean(abs((peakbias$maxSWE-peakbias$maxSimSWE)*100/peakbias$maxSWE), narm=TRUE),0)
+    
+    rownames(metrics)[3]<-"maxSWEmape"
+    
+    metrics
+  }
+  
+)
+
+
+valid<-as.data.frame(t(eval_results))
+valid$Station<-colnames(eval_results)
+valid$Station<-as.numeric(valid$Station)
+
+valid<-merge(unique(SNOTEL[,c(1:5)]), valid, by="Station", all=FALSE) #
+
+
+```
+
+# Density histogram for the resulted Nash--Sutcliffe Efficiency (NSE) coefficients:
+
+```{r}
+
+annotations_NSE <- data.frame(
+  x = c(round(quantile(valid$NSE, 0.05), 2), round(median(valid$NSE), 2), round(max(valid$NSE), 2)),
+  label = c("q05:", "Median:", "max:")
+) 
+
+valid$NSE_bins<-cut(valid$NSE, breaks=seq(0,1, by=0.2))
+
+ggplot(valid, aes(NSE, fill=NSE_bins)) +
+  geom_histogram(color = "#000000",  breaks=seq(0,1, by=0.01))+
+  geom_vline(xintercept = annotations_NSE[2,1], col='red', linetype='longdash', size=0.8)+
+  geom_vline(xintercept = annotations_NSE[1,1], col='black', linetype='longdash', size=0.8)+
+  scale_x_continuous(breaks=seq(0,1, by=0.2))+
+  scale_y_continuous(position = "right")+
+  scale_fill_manual(values=c('#fe9929','#ffffcc','#a1dab4','#2c7fb8','#253494'))+
+  theme( panel.background = element_rect(fill='transparent', colour='black', size=1.2),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         text=element_text(colour = "black",size=16),
+         axis.title.y = element_blank(),
+         legend.position = 'none',
+         axis.title.x= element_text(size=16),
+         legend.key.height = unit(1,'cm'),
+         legend.key.width =  unit(0.4,'cm'),
+         legend.title = element_blank(),
+         legend.text = element_text(size=8),
+         legend.background = element_blank(),
+         legend.box.background = element_rect(color='black'))+
+  labs(x="NSE")
+
+```
+
+# Density histogram for the resulted mean absolute percentage error of peak SWE (maxSWE MAPE):
+
+```{r}
+valid$Pmape_bins<-cut(valid$maxSWEmape, breaks=c(0,10,20,30.40,50, Inf), na.rm=TRUE)
+
+annotations_maxSWEmape <- data.frame(
+  x = c(round(quantile(valid$maxSWEmape, 0.05, na.rm = TRUE), 2), round(median(valid$maxSWEmape,na.rm = TRUE), 2), round(quantile(valid$maxSWEmape, 0.95,na.rm = TRUE), 2)),
+  label = c("q05:", "Median:", "q95:")
+) 
+
+ggplot(valid, aes(maxSWEmape, fill=Pmape_bins)) +
+  geom_histogram(color = "#000000",  breaks=seq(0,60, by=1))+
+  geom_vline(xintercept = annotations_maxSWEmape[2,1], col='red', linetype='longdash', size=0.8)+
+  geom_vline(xintercept = annotations_maxSWEmape[3,1], col='black', linetype='longdash', size=0.8)+
+  scale_x_continuous(breaks=seq(0,60, by=10),labels = scales::percent_format(scale = 1))+
+  scale_y_continuous(position = "right")+
+  scale_fill_manual(labels=c("(-Inf, -45%]","(-45%,-30%]","(-30%,-15%]","(-15%, 15%]","(15%, 30%]", "(30%, 45%]","(45%, Inf]"),
+                    values=c('#253494','#2c7fb8','#a1dab4','#ffffcc','#fe9929','#fe9929'))+
+  theme( panel.background = element_rect(fill='transparent', colour='black', size=1.2),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         text=element_text(colour = "black",size=16),
+         axis.title.y = element_blank(),
+         legend.position = 'none',
+         axis.title.x= element_text(size=16),
+         legend.key.height = unit(1,'cm'),
+         legend.key.width =  unit(0.4,'cm'),
+         legend.title = element_blank(),
+         legend.text = element_text(size=8),
+         legend.background = element_blank(),
+         legend.box.background = element_rect(color='black'))+
+  labs(x="maxSWE MAPE")
+
+```
+
+# Density histogram for the resulted biases of the simulated peak SWE (maxSWE BIAS):
+
+```{r}
+valid$Pbias_bins<-cut(valid$maxSWEbias, breaks=c(-Inf,-45,-30,-15,15,30,45, Inf), na.rm=TRUE)
+
+annotations_maxSWEbias <- data.frame(
+  x = c(round(quantile(valid$maxSWEbias, 0.05, na.rm = TRUE), 2), round(median(valid$maxSWEbias,na.rm = TRUE), 2), round(quantile(valid$maxSWEbias, 0.95,na.rm = TRUE), 2)),
+  label = c("q05:", "Median:", "q95:")
+) 
+
+ggplot(valid, aes(maxSWEbias, fill=Pbias_bins)) +
+  geom_histogram(color = "#000000",  breaks=seq(-60,60, by=2))+
+  geom_vline(xintercept = annotations_maxSWEbias[2,1], col='red', linetype='longdash', size=0.8)+
+  geom_vline(xintercept = annotations_maxSWEbias[1,1], col='black', linetype='longdash', size=0.8)+
+  geom_vline(xintercept = annotations_maxSWEbias[3,1], col='black', linetype='longdash', size=0.8)+
+  scale_x_continuous(breaks=seq(-60,60, by=15),labels = scales::percent_format(scale = 1))+
+  scale_y_continuous(position = "right")+
+  scale_fill_manual(labels=c("(-Inf, -45%]","(-45%,-30%]","(-30%,-15%]","(-15%, 15%]","(15%, 30%]", "(30%, 45%]","(45%, Inf]"),
+                    values=c('#b2182b','#ef8a62','#fddbc7','white','#d1e5f0','#67a9cf','#2166ac'))+
+  theme( panel.background = element_rect(fill='transparent', colour='black', size=1.2),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         text=element_text(colour = "black",size=16),
+         axis.title.y = element_blank(),
+         legend.position = 'none',
+         axis.title.x= element_text(size=16),
+         legend.key.height = unit(1,'cm'),
+         legend.key.width =  unit(0.4,'cm'),
+         legend.title = element_blank(),
+         legend.text = element_text(size=8),
+         legend.background = element_blank(),
+         legend.box.background = element_rect(color='black'))+
+  labs(x="maxSWE bias")
+```
+
+# Density histogram for the resulted snow melt-out errors:
+
+```{r}
+valid$daydiff_bins<-cut(valid$diff.days, breaks=c(-Inf,-21,-14,-7,7,14,21, Inf))
+annotations_daydiff<- data.frame(
+  x = c(round(quantile(valid$diff.days, 0.05, na.rm = TRUE), 2), round(median(valid$diff.days, na.rm = TRUE), 2), round(quantile(valid$diff.days, 0.95, na.rm = TRUE), 2)),
+  label = c("q05:", "Median:", "q95:")
+) 
+
+ggplot(valid, aes(diff.days, fill=daydiff_bins)) +
+  geom_histogram(color = "#000000",  breaks=seq(-60,60, by=1.8))+
+  geom_vline(xintercept = annotations_daydiff[1,1], col='black', linetype='longdash', size=0.8)+
+  geom_vline(xintercept = annotations_daydiff[2,1], col='red', linetype='longdash', size=0.8)+
+  geom_vline(xintercept = annotations_daydiff[3,1], col='black', linetype='longdash', size=0.8)+
+  scale_x_continuous(breaks=seq(-60,60, by=10))+
+  scale_y_continuous(position = "right")+
+  scale_fill_manual(values=c('#b2182b','#ef8a62','#fddbc7','white','#d1e5f0','#67a9cf','#2166ac'))+
+  theme( panel.background = element_rect(fill='transparent', colour='black', size=1.2),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         text=element_text(colour = "black",size=16),
+         axis.title.y = element_blank(),
+         legend.position = 'none',
+         axis.title.x= element_text(size=16),
+         legend.key.height = unit(1,'cm'),
+         legend.key.width =  unit(0.4,'cm'),
+         legend.title = element_blank(),
+         legend.text = element_text(size=8),
+         legend.background = element_blank(),
+         legend.box.background = element_rect(color='black'))+
+  labs(x="snow meltout date error")
+```
+
+
+# The following code chunks are for the evaluation of the model performance using seven SnowMIP reference stations:
+
+```{r}
+
+SnowMIP <- read_csv("...GEMS_v1.0/SnowMIP.csv", 
+                    col_types = cols(...1 = col_skip()))
+
+str(SnowMIP) # The dataset includes both meteorological and snow data from SNOTEL stations. 
+
+```
+
+# Running the model using observations from the Col de Port station:
+
+```{r}
+station<-SnowMIP[SnowMIP$Station=='CDP',] #Extracting observations for the "CDP"station
+
+# Snow observations for the stations are available as either manual or automatic measurements, both containing missing values. However, the model can only run on dataframes without NAs. We therefore separate snow observations into 'SWE' file while keeping only meteorological inputs in the 'station':  
+SWE<-station[,c(4,5,6)] 
+station<-station[,-c(5,6)]
+
+# Generating additional variables: 
+station$DAYL<-geosphere:: daylength(station$LAT, station$Date)  # Daylength
+
+station$TSUM<-data.table::frollsum(station$TAVG, algo="exact", n=3, align='right')
+station<-station %>% 
+  mutate(TSUM = lag(TSUM))   # Rolling sum of temperature over preceding three days
+
+station$PSUM<-data.table::frollsum(station$PRCP, algo="exact", n=3, align='right')
+station<-station %>% 
+  mutate(PSUM = lag(PSUM))   # Rolling sum of precipitation over preceding three days
+
+
+station<-station[-c(1:3),] # Input data should not contain any missing values. Since TSUM and PSUM are not available for the first three days of the input timeserie, we have to exclude first three rows. 
+
+```
+
+# Running the model:
+
+```{r}
+{
+  station$dSWE<-ifelse(station$TAVG < -1, # this serves as temperature criterion when all precipitation is considered as snowfall
+                       station$PRCP,  # 
+                       predict(SVR_7P, station))
+  
+  station$simSWE<- Reduce(\(.x, .y) ifelse(.x + .y < 0, 0, .x + .y), station$dSWE, accumulate = TRUE) # this line is the cumulative sum-reset function
+
+  station$simSWE[1]<- ifelse(station$simSWE[1]<0, 0,station$simSWE[1])   
+}
+
+```
+
+```{r}
+station<-merge(station,SWE, by='Date') # merging separated SWE observations back to 'station' 
+
+hydroGOF::gof(station$SWE_man, station$simSWE, na.rm=TRUE,
+               gofs = c("MAE", "RMSE", "NSE", "R2", "KGE"))
+
+ggplot(station, aes(x= Date, group=1)) +
+  geom_line(aes(y=simSWE), col="red",lwd=1,alpha=1)+
+  geom_point(aes(y=SWE_man), col="blue",size=2.8, alpha=0.6)+
+  theme_bw()+
+  theme( axis.title.x= element_text(),
+         axis.title.y= element_blank())
+
+maxSWE<-station %>% 
+  group_by(year(Date)) %>% 
+  dplyr::summarise(maxSWE=max(SWE_man,na.rm = TRUE),
+                   maxSimSWE=max(simSWE))%>% slice(-1) # a dataframe of max observed and simulated SWE for each year
+
+
+round(MLmetrics::MAPE(maxSWE$maxSWE,maxSWE$maxSimSWE),2)*100  #maxSWE MAPE (%)
+hydroGOF::pbias(maxSWE$maxSWE,maxSWE$maxSimSWE)   #maxSWE bias (%)
+
+
+```
