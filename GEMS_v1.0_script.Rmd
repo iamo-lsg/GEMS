@@ -20,16 +20,16 @@ invisible(lapply(packages, library, character.only = TRUE))
 # The pretrained SVR model is available in three versions, each designed for a different number of predictors:
 
 ```{r}
-SVR_7P <- readRDS(".../GEMS_v1.0/SVR_GEMS_7P.rds")
-SVR_5P <- readRDS(".../GEMS_v1.0/SVR_GEMS_5P.rds")
-SVR_4P <- readRDS(".../GEMS_v1.0/SVR_GEMS_4P.rds")
+SVR_7P <- readRDS(".../SVR_GEMS_7P.rds")
+SVR_5P <- readRDS(".../SVR_GEMS_5P.rds")
+SVR_4P <- readRDS(".../SVR_GEMS_4P.rds")
 ```
 
-# Download the independent SNOTEL stations data
+# Load the independent SNOTEL stations data. The dataset is available for download (160MB) from the following link https://leibnizinstitutiamo-my.sharepoint.com/:x:/g/personal/umirbekov_iamo_de/EQpcEOlaLAJApCNEl4CxN30BpYN21NzBTWzmwqj0pHbNTQ?e=ewqMOz 
 
 ```{r}
 
-SNOTEL<-read_csv("...GEMS_v1.0/SNOTEL.csv", 
+SNOTEL<-read_csv(".../SNOTEL.csv", 
                  col_types = cols(...1 = col_skip()))
 
 str(SNOTEL, max.level=1) 
