@@ -25,7 +25,7 @@ SVR_5P <- readRDS(".../SVR_GEMS_5P.rds")
 SVR_4P <- readRDS(".../SVR_GEMS_4P.rds")
 ```
 
-# Load the independent SNOTEL stations data. The dataset is available for download (160MB) from the following link https://leibnizinstitutiamo-my.sharepoint.com/:x:/g/personal/umirbekov_iamo_de/EQpcEOlaLAJApCNEl4CxN30BpYN21NzBTWzmwqj0pHbNTQ?e=ewqMOz 
+# Load the independent SNOTEL stations data. The dataset is available for download (160MB) from the following link https://zenodo.org/record/7929181 
 
 ```{r}
 
